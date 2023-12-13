@@ -1,4 +1,4 @@
-# Copyright 2019-2021 The Matrix.org Foundation C.I.C.
+# Copyright 2019-2022 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, cast
 
 import attr
 
@@ -23,12 +23,13 @@ from synapse.events import make_event_from_dict
 from synapse.storage._base import SQLBaseStore, db_to_json, make_in_list_sql_clause
 from synapse.storage.database import (
     DatabasePool,
+    LoggingDatabaseConnection,
     LoggingTransaction,
     make_tuple_comparison_clause,
 )
 from synapse.storage.databases.main.events import PersistEventsStore
 from synapse.storage.types import Cursor
-from synapse.types import JsonDict
+from synapse.types import JsonDict, StrCollection
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -63,27 +64,39 @@ class _BackgroundUpdates:
     INDEX_STREAM_ORDERING2_TS = "index_stream_ordering2_ts"
     REPLACE_STREAM_ORDERING_COLUMN = "replace_stream_ordering_column"
 
+    EVENT_EDGES_DROP_INVALID_ROWS = "event_edges_drop_invalid_rows"
+    EVENT_EDGES_REPLACE_INDEX = "event_edges_replace_index"
 
-@attr.s(slots=True, frozen=True)
+    EVENTS_POPULATE_STATE_KEY_REJECTIONS = "events_populate_state_key_rejections"
+
+    EVENTS_JUMP_TO_DATE_INDEX = "events_jump_to_date_index"
+
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
 class _CalculateChainCover:
     """Return value for _calculate_chain_cover_txn."""
 
     # The last room_id/depth/stream processed.
-    room_id = attr.ib(type=str)
-    depth = attr.ib(type=int)
-    stream = attr.ib(type=int)
+    room_id: str
+    depth: int
+    stream: int
 
     # Number of rows processed
-    processed_count = attr.ib(type=int)
+    processed_count: int
 
     # Map from room_id to last depth/stream processed for each room that we have
     # processed all events for (i.e. the rooms we can flip the
     # `has_auth_chain_index` for)
-    finished_room_map = attr.ib(type=Dict[str, Tuple[int, int]])
+    finished_room_map: Dict[str, Tuple[int, int]]
 
 
 class EventsBackgroundUpdatesStore(SQLBaseStore):
-    def __init__(self, database: DatabasePool, db_conn, hs: "HomeServer"):
+    def __init__(
+        self,
+        database: DatabasePool,
+        db_conn: LoggingDatabaseConnection,
+        hs: "HomeServer",
+    ):
         super().__init__(database, db_conn, hs)
 
         self.db_pool.updates.register_background_update_handler(
@@ -171,11 +184,6 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
             self._purged_chain_cover_index,
         )
 
-        # The event_thread_relation background update was replaced with the
-        # event_arbitrary_relations one, which handles any relation to avoid
-        # needed to potentially crawl the entire events table in the future.
-        self.db_pool.updates.register_noop_background_update("event_thread_relation")
-
         self.db_pool.updates.register_background_update_handler(
             "event_arbitrary_relations",
             self._event_arbitrary_relations,
@@ -234,12 +242,44 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         ################################################################################
 
-    async def _background_reindex_fields_sender(self, progress, batch_size):
+        self.db_pool.updates.register_background_update_handler(
+            _BackgroundUpdates.EVENT_EDGES_DROP_INVALID_ROWS,
+            self._background_drop_invalid_event_edges_rows,
+        )
+
+        self.db_pool.updates.register_background_index_update(
+            _BackgroundUpdates.EVENT_EDGES_REPLACE_INDEX,
+            index_name="event_edges_event_id_prev_event_id_idx",
+            table="event_edges",
+            columns=["event_id", "prev_event_id"],
+            unique=True,
+            # the old index which just covered event_id is now redundant.
+            replaces_index="ev_edges_id",
+        )
+
+        self.db_pool.updates.register_background_update_handler(
+            _BackgroundUpdates.EVENTS_POPULATE_STATE_KEY_REJECTIONS,
+            self._background_events_populate_state_key_rejections,
+        )
+
+        # Add an index that would be useful for jumping to date using
+        # get_event_id_for_timestamp.
+        self.db_pool.updates.register_background_index_update(
+            _BackgroundUpdates.EVENTS_JUMP_TO_DATE_INDEX,
+            index_name="events_jump_to_date_idx",
+            table="events",
+            columns=["room_id", "origin_server_ts"],
+            where_clause="NOT outlier",
+        )
+
+    async def _background_reindex_fields_sender(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
         target_min_stream_id = progress["target_min_stream_id_inclusive"]
         max_stream_id = progress["max_stream_id_exclusive"]
         rows_inserted = progress.get("rows_inserted", 0)
 
-        def reindex_txn(txn):
+        def reindex_txn(txn: LoggingTransaction) -> int:
             sql = (
                 "SELECT stream_ordering, event_id, json FROM events"
                 " INNER JOIN event_json USING (event_id)"
@@ -301,12 +341,14 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         return result
 
-    async def _background_reindex_origin_server_ts(self, progress, batch_size):
+    async def _background_reindex_origin_server_ts(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
         target_min_stream_id = progress["target_min_stream_id_inclusive"]
         max_stream_id = progress["max_stream_id_exclusive"]
         rows_inserted = progress.get("rows_inserted", 0)
 
-        def reindex_search_txn(txn):
+        def reindex_search_txn(txn: LoggingTransaction) -> int:
             sql = (
                 "SELECT stream_ordering, event_id FROM events"
                 " WHERE ? <= stream_ordering AND stream_ordering < ?"
@@ -327,18 +369,20 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
             chunks = [event_ids[i : i + 100] for i in range(0, len(event_ids), 100)]
             for chunk in chunks:
-                ev_rows = self.db_pool.simple_select_many_txn(
-                    txn,
-                    table="event_json",
-                    column="event_id",
-                    iterable=chunk,
-                    retcols=["event_id", "json"],
-                    keyvalues={},
+                ev_rows = cast(
+                    List[Tuple[str, str]],
+                    self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="event_json",
+                        column="event_id",
+                        iterable=chunk,
+                        retcols=["event_id", "json"],
+                        keyvalues={},
+                    ),
                 )
 
-                for row in ev_rows:
-                    event_id = row["event_id"]
-                    event_json = db_to_json(row["json"])
+                for event_id, json in ev_rows:
+                    event_json = db_to_json(json)
                     try:
                         origin_server_ts = event_json["origin_server_ts"]
                     except (KeyError, AttributeError):
@@ -375,11 +419,13 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         return result
 
-    async def _cleanup_extremities_bg_update(self, progress, batch_size):
+    async def _cleanup_extremities_bg_update(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
         """Background update to clean out extremities that should have been
         deleted previously.
 
-        Mainly used to deal with the aftermath of #5269.
+        Mainly used to deal with the aftermath of https://github.com/matrix-org/synapse/issues/5269.
         """
 
         # This works by first copying all existing forward extremities into the
@@ -396,12 +442,12 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         # have any descendants, but if they do then we should delete those
         # extremities.
 
-        def _cleanup_extremities_bg_update_txn(txn):
+        def _cleanup_extremities_bg_update_txn(txn: LoggingTransaction) -> int:
             # The set of extremity event IDs that we're checking this round
             original_set = set()
 
-            # A dict[str, set[str]] of event ID to their prev events.
-            graph = {}
+            # A dict[str, Set[str]] of event ID to their prev events.
+            graph: Dict[str, Set[str]] = {}
 
             # The set of descendants of the original set that are not rejected
             # nor soft-failed. Ancestors of these events should be removed
@@ -512,25 +558,28 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
             )
 
             logger.info(
-                "Deleted %d forward extremities of %d checked, to clean up #5269",
+                "Deleted %d forward extremities of %d checked, to clean up matrix-org/synapse#5269",
                 deleted,
                 len(original_set),
             )
 
             if deleted:
                 # We now need to invalidate the caches of these rooms
-                rows = self.db_pool.simple_select_many_txn(
-                    txn,
-                    table="events",
-                    column="event_id",
-                    iterable=to_delete,
-                    keyvalues={},
-                    retcols=("room_id",),
+                rows = cast(
+                    List[Tuple[str]],
+                    self.db_pool.simple_select_many_txn(
+                        txn,
+                        table="events",
+                        column="event_id",
+                        iterable=to_delete,
+                        keyvalues={},
+                        retcols=("room_id",),
+                    ),
                 )
-                room_ids = {row["room_id"] for row in rows}
+                room_ids = {row[0] for row in rows}
                 for room_id in room_ids:
                     txn.call_after(
-                        self.get_latest_event_ids_in_room.invalidate, (room_id,)
+                        self.get_latest_event_ids_in_room.invalidate, (room_id,)  # type: ignore[attr-defined]
                     )
 
             self.db_pool.simple_delete_many_txn(
@@ -552,7 +601,7 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
                 _BackgroundUpdates.DELETE_SOFT_FAILED_EXTREMITIES
             )
 
-            def _drop_table_txn(txn):
+            def _drop_table_txn(txn: LoggingTransaction) -> None:
                 txn.execute("DROP TABLE _extremities_to_check")
 
             await self.db_pool.runInteraction(
@@ -561,11 +610,11 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         return num_handled
 
-    async def _redactions_received_ts(self, progress, batch_size):
+    async def _redactions_received_ts(self, progress: JsonDict, batch_size: int) -> int:
         """Handles filling out the `received_ts` column in redactions."""
         last_event_id = progress.get("last_event_id", "")
 
-        def _redactions_received_ts_txn(txn):
+        def _redactions_received_ts_txn(txn: LoggingTransaction) -> int:
             # Fetch the set of event IDs that we want to update
             sql = """
                 SELECT event_id FROM redactions
@@ -616,10 +665,12 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         return count
 
-    async def _event_fix_redactions_bytes(self, progress, batch_size):
+    async def _event_fix_redactions_bytes(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
         """Undoes hex encoded censored redacted event JSON."""
 
-        def _event_fix_redactions_bytes_txn(txn):
+        def _event_fix_redactions_bytes_txn(txn: LoggingTransaction) -> None:
             # This update is quite fast due to new index.
             txn.execute(
                 """
@@ -644,11 +695,11 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         return 1
 
-    async def _event_store_labels(self, progress, batch_size):
+    async def _event_store_labels(self, progress: JsonDict, batch_size: int) -> int:
         """Background update handler which will store labels for existing events."""
         last_event_id = progress.get("last_event_id", "")
 
-        def _event_store_labels_txn(txn):
+        def _event_store_labels_txn(txn: LoggingTransaction) -> int:
             txn.execute(
                 """
                 SELECT event_id, json FROM event_json
@@ -663,20 +714,21 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
             nbrows = 0
             last_row_event_id = ""
-            for (event_id, event_json_raw) in results:
+            for event_id, event_json_raw in results:
                 try:
                     event_json = db_to_json(event_json_raw)
 
                     self.db_pool.simple_insert_many_txn(
                         txn=txn,
                         table="event_labels",
+                        keys=("event_id", "label", "room_id", "topological_ordering"),
                         values=[
-                            {
-                                "event_id": event_id,
-                                "label": label,
-                                "room_id": event_json["room_id"],
-                                "topological_ordering": event_json["depth"],
-                            }
+                            (
+                                event_id,
+                                label,
+                                event_json["room_id"],
+                                event_json["depth"],
+                            )
                             for label in event_json["content"].get(
                                 EventContentFields.LABELS, []
                             )
@@ -748,7 +800,10 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
                 ),
             )
 
-            return [(row[0], row[1], db_to_json(row[2]), row[3], row[4]) for row in txn]  # type: ignore
+            return cast(
+                List[Tuple[str, str, JsonDict, bool, bool]],
+                [(row[0], row[1], db_to_json(row[2]), row[3], row[4]) for row in txn],
+            )
 
         results = await self.db_pool.runInteraction(
             desc="_rejected_events_metadata_get", func=get_rejected_events
@@ -786,29 +841,19 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
             if not has_state:
                 state_events.append(
-                    {
-                        "event_id": event.event_id,
-                        "room_id": event.room_id,
-                        "type": event.type,
-                        "state_key": event.state_key,
-                    }
+                    (event.event_id, event.room_id, event.type, event.state_key)
                 )
 
             if not has_event_auth:
                 # Old, dodgy, events may have duplicate auth events, which we
                 # need to deduplicate as we have a unique constraint.
                 for auth_id in set(event.auth_event_ids()):
-                    auth_events.append(
-                        {
-                            "room_id": event.room_id,
-                            "event_id": event.event_id,
-                            "auth_id": auth_id,
-                        }
-                    )
+                    auth_events.append((event.event_id, event.room_id, auth_id))
 
         if state_events:
             await self.db_pool.simple_insert_many(
                 table="state_events",
+                keys=("event_id", "room_id", "type", "state_key"),
                 values=state_events,
                 desc="_rejected_events_metadata_state_events",
             )
@@ -816,6 +861,7 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         if auth_events:
             await self.db_pool.simple_insert_many(
                 table="event_auth",
+                keys=("event_id", "room_id", "auth_id"),
                 values=auth_events,
                 desc="_rejected_events_metadata_event_auth",
             )
@@ -906,7 +952,7 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
     def _calculate_chain_cover_txn(
         self,
-        txn: Cursor,
+        txn: LoggingTransaction,
         last_room_id: str,
         last_depth: int,
         last_stream: int,
@@ -997,18 +1043,21 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         count = len(rows)
 
         # We also need to fetch the auth events for them.
-        auth_events = self.db_pool.simple_select_many_txn(
-            txn,
-            table="event_auth",
-            column="event_id",
-            iterable=event_to_room_id,
-            keyvalues={},
-            retcols=("event_id", "auth_id"),
+        auth_events = cast(
+            List[Tuple[str, str]],
+            self.db_pool.simple_select_many_txn(
+                txn,
+                table="event_auth",
+                column="event_id",
+                iterable=event_to_room_id,
+                keyvalues={},
+                retcols=("event_id", "auth_id"),
+            ),
         )
 
         event_to_auth_chain: Dict[str, List[str]] = {}
-        for row in auth_events:
-            event_to_auth_chain.setdefault(row["event_id"], []).append(row["auth_id"])
+        for event_id, auth_id in auth_events:
+            event_to_auth_chain.setdefault(event_id, []).append(auth_id)
 
         # Calculate and persist the chain cover index for this set of events.
         #
@@ -1017,10 +1066,10 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         PersistEventsStore._add_chain_cover_index(
             txn,
             self.db_pool,
-            self.event_chain_id_gen,
+            self.event_chain_id_gen,  # type: ignore[attr-defined]
             event_to_room_id,
             event_to_types,
-            event_to_auth_chain,
+            cast(Dict[str, StrCollection], event_to_auth_chain),
         )
 
         return _CalculateChainCover(
@@ -1040,7 +1089,7 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         """
         current_event_id = progress.get("current_event_id", "")
 
-        def purged_chain_cover_txn(txn) -> int:
+        def purged_chain_cover_txn(txn: LoggingTransaction) -> int:
             # The event ID from events will be null if the chain ID / sequence
             # number points to a purged event.
             sql = """
@@ -1126,7 +1175,7 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
             results = list(txn)
             # (event_id, parent_id, rel_type) for each relation
             relations_to_insert: List[Tuple[str, str, str]] = []
-            for (event_id, event_json_raw) in results:
+            for event_id, event_json_raw in results:
                 try:
                     event_json = db_to_json(event_json_raw)
                 except Exception as e:
@@ -1173,17 +1222,13 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
                 )
 
                 # Iterate the parent IDs and invalidate caches.
-                for parent_id in {r[1] for r in relations_to_insert}:
-                    cache_tuple = (parent_id,)
-                    self._invalidate_cache_and_stream(
-                        txn, self.get_relations_for_event, cache_tuple
-                    )
-                    self._invalidate_cache_and_stream(
-                        txn, self.get_aggregation_groups_for_event, cache_tuple
-                    )
-                    self._invalidate_cache_and_stream(
-                        txn, self.get_thread_summary, cache_tuple
-                    )
+                cache_tuples = {(r[1],) for r in relations_to_insert}
+                self._invalidate_cache_and_stream_bulk(  # type: ignore[attr-defined]
+                    txn, self.get_relations_for_event, cache_tuples  # type: ignore[attr-defined]
+                )
+                self._invalidate_cache_and_stream_bulk(  # type: ignore[attr-defined]
+                    txn, self.get_thread_summary, cache_tuples  # type: ignore[attr-defined]
+                )
 
             if results:
                 latest_event_id = results[-1][0]
@@ -1214,7 +1259,7 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         """
         batch_size = max(batch_size, 1)
 
-        def process(txn: Cursor) -> int:
+        def process(txn: LoggingTransaction) -> int:
             last_stream = progress.get("last_stream", -(1 << 31))
             txn.execute(
                 """
@@ -1264,12 +1309,9 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
 
         # ANALYZE the new column to build stats on it, to encourage PostgreSQL to use the
         # indexes on it.
-        # We need to pass execute a dummy function to handle the txn's result otherwise
-        # it tries to call fetchall() on it and fails because there's no result to fetch.
-        await self.db_pool.execute(
+        await self.db_pool.runInteraction(
             "background_analyze_new_stream_ordering_column",
-            lambda txn: None,
-            "ANALYZE events(stream_ordering2)",
+            lambda txn: txn.execute("ANALYZE events(stream_ordering2)"),
         )
 
         await self.db_pool.runInteraction(
@@ -1281,3 +1323,179 @@ class EventsBackgroundUpdatesStore(SQLBaseStore):
         )
 
         return 0
+
+    async def _background_drop_invalid_event_edges_rows(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
+        """Drop invalid rows from event_edges
+
+        This only runs for postgres. For SQLite, it all happens synchronously.
+
+        Firstly, drop any rows with is_state=True. These may have been added a long time
+        ago, but they are no longer used.
+
+        We also drop rows that do not correspond to entries in `events`, and add a
+        foreign key.
+        """
+
+        last_event_id = progress.get("last_event_id", "")
+
+        def drop_invalid_event_edges_txn(txn: LoggingTransaction) -> bool:
+            """Returns True if we're done."""
+
+            # first we need to find an endpoint.
+            txn.execute(
+                """
+                SELECT event_id FROM event_edges
+                WHERE event_id > ?
+                ORDER BY event_id
+                LIMIT 1 OFFSET ?
+                """,
+                (last_event_id, batch_size),
+            )
+
+            endpoint = None
+            row = txn.fetchone()
+
+            if row:
+                endpoint = row[0]
+
+            where_clause = "ee.event_id > ?"
+            args = [last_event_id]
+            if endpoint:
+                where_clause += " AND ee.event_id <= ?"
+                args.append(endpoint)
+
+            # now delete any that:
+            #   - have is_state=TRUE, or
+            #   - do not correspond to a row in `events`
+            txn.execute(
+                f"""
+                DELETE FROM event_edges
+                WHERE event_id IN (
+                   SELECT ee.event_id
+                   FROM event_edges ee
+                     LEFT JOIN events ev USING (event_id)
+                   WHERE ({where_clause}) AND
+                     (is_state OR ev.event_id IS NULL)
+                )""",
+                args,
+            )
+
+            logger.info(
+                "cleaned up event_edges up to %s: removed %i/%i rows",
+                endpoint,
+                txn.rowcount,
+                batch_size,
+            )
+
+            if endpoint is not None:
+                self.db_pool.updates._background_update_progress_txn(
+                    txn,
+                    _BackgroundUpdates.EVENT_EDGES_DROP_INVALID_ROWS,
+                    {"last_event_id": endpoint},
+                )
+                return False
+
+            # if that was the final batch, we validate the foreign key.
+            #
+            # The constraint should have been in place and enforced for new rows since
+            # before we started deleting invalid rows, so there's no chance for any
+            # invalid rows to have snuck in the meantime. In other words, this really
+            # ought to succeed.
+            logger.info("cleaned up event_edges; enabling foreign key")
+            txn.execute(
+                "ALTER TABLE event_edges VALIDATE CONSTRAINT event_edges_event_id_fkey"
+            )
+            return True
+
+        done = await self.db_pool.runInteraction(
+            desc="drop_invalid_event_edges", func=drop_invalid_event_edges_txn
+        )
+
+        if done:
+            await self.db_pool.updates._end_background_update(
+                _BackgroundUpdates.EVENT_EDGES_DROP_INVALID_ROWS
+            )
+
+        return batch_size
+
+    async def _background_events_populate_state_key_rejections(
+        self, progress: JsonDict, batch_size: int
+    ) -> int:
+        """Back-populate `events.state_key` and `events.rejection_reason"""
+
+        min_stream_ordering_exclusive = progress["min_stream_ordering_exclusive"]
+        max_stream_ordering_inclusive = progress["max_stream_ordering_inclusive"]
+
+        def _populate_txn(txn: LoggingTransaction) -> bool:
+            """Returns True if we're done."""
+
+            # first we need to find an endpoint.
+            # we need to find the final row in the batch of batch_size, which means
+            # we need to skip over (batch_size-1) rows and get the next row.
+            txn.execute(
+                """
+                SELECT stream_ordering FROM events
+                WHERE stream_ordering > ? AND stream_ordering <= ?
+                ORDER BY stream_ordering
+                LIMIT 1 OFFSET ?
+                """,
+                (
+                    min_stream_ordering_exclusive,
+                    max_stream_ordering_inclusive,
+                    batch_size - 1,
+                ),
+            )
+
+            row = txn.fetchone()
+            if row:
+                endpoint = row[0]
+            else:
+                # if the query didn't return a row, we must be almost done. We just
+                # need to go up to the recorded max_stream_ordering.
+                endpoint = max_stream_ordering_inclusive
+
+            where_clause = "stream_ordering > ? AND stream_ordering <= ?"
+            args = [min_stream_ordering_exclusive, endpoint]
+
+            # now do the updates.
+            txn.execute(
+                f"""
+                UPDATE events
+                SET state_key = (SELECT state_key FROM state_events se WHERE se.event_id = events.event_id),
+                    rejection_reason = (SELECT reason FROM rejections rej WHERE rej.event_id = events.event_id)
+                WHERE ({where_clause})
+                """,
+                args,
+            )
+
+            logger.info(
+                "populated new `events` columns up to %i/%i: updated %i rows",
+                endpoint,
+                max_stream_ordering_inclusive,
+                txn.rowcount,
+            )
+
+            if endpoint >= max_stream_ordering_inclusive:
+                # we're done
+                return True
+
+            progress["min_stream_ordering_exclusive"] = endpoint
+            self.db_pool.updates._background_update_progress_txn(
+                txn,
+                _BackgroundUpdates.EVENTS_POPULATE_STATE_KEY_REJECTIONS,
+                progress,
+            )
+            return False
+
+        done = await self.db_pool.runInteraction(
+            desc="events_populate_state_key_rejections", func=_populate_txn
+        )
+
+        if done:
+            await self.db_pool.updates._end_background_update(
+                _BackgroundUpdates.EVENTS_POPULATE_STATE_KEY_REJECTIONS
+            )
+
+        return batch_size

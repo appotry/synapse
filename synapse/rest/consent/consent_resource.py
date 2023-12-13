@@ -78,7 +78,7 @@ class ConsentResource(DirectServeHtmlResource):
         super().__init__()
 
         self.hs = hs
-        self.store = hs.get_datastore()
+        self.store = hs.get_datastores().main
         self.registration_handler = hs.get_registration_handler()
 
         # this is required by the request_handler wrapper
@@ -129,7 +129,7 @@ class ConsentResource(DirectServeHtmlResource):
             if u is None:
                 raise NotFoundError("Unknown user")
 
-            has_consented = u["consent_version"] == version
+            has_consented = u.consent_version == version
             userhmac = userhmac_bytes.decode("ascii")
 
         try:

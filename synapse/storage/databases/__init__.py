@@ -24,6 +24,7 @@ from synapse.storage.prepare_database import prepare_database
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.storage.databases.main import DataStore
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class Databases(Generic[DataStoreT]):
     """
 
     databases: List[DatabasePool]
-    main: DataStoreT
+    main: "DataStore"  # FIXME: https://github.com/matrix-org/synapse/issues/11165: actually an instance of `main_store_class`
     state: StateGroupDataStore
     persist_events: Optional[PersistEventsStore]
 
@@ -94,7 +95,7 @@ class Databases(Generic[DataStoreT]):
                     # If we're on a process that can persist events also
                     # instantiate a `PersistEventsStore`
                     if hs.get_instance_name() in hs.config.worker.writers.events:
-                        persist_events = PersistEventsStore(hs, database, main, db_conn)
+                        persist_events = PersistEventsStore(hs, database, main, db_conn)  # type: ignore[arg-type]
 
                 if "state" in database_config.databases:
                     logger.info(
@@ -132,6 +133,6 @@ class Databases(Generic[DataStoreT]):
 
         # We use local variables here to ensure that the databases do not have
         # optional types.
-        self.main = main
+        self.main = main  # type: ignore[assignment]
         self.state = state
         self.persist_events = persist_events

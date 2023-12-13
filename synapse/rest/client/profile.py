@@ -14,11 +14,16 @@
 
 """ This module contains REST servlets to do with profile: /profile/<paths> """
 
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Tuple
 
 from synapse.api.errors import Codes, SynapseError
 from synapse.http.server import HttpServer
-from synapse.http.servlet import RestServlet, parse_json_object_from_request
+from synapse.http.servlet import (
+    RestServlet,
+    parse_boolean,
+    parse_json_object_from_request,
+)
 from synapse.http.site import SynapseRequest
 from synapse.rest.client._base import client_patterns
 from synapse.types import JsonDict, UserID
@@ -27,8 +32,23 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 
+def _read_propagate(hs: "HomeServer", request: SynapseRequest) -> bool:
+    # This will always be set by the time Twisted calls us.
+    assert request.args is not None
+
+    propagate = True
+    if hs.config.experimental.msc4069_profile_inhibit_propagation:
+        do_propagate = request.args.get(b"org.matrix.msc4069.propagate")
+        if do_propagate is not None:
+            propagate = parse_boolean(
+                request, "org.matrix.msc4069.propagate", default=False
+            )
+    return propagate
+
+
 class ProfileDisplaynameRestServlet(RestServlet):
     PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)/displayname", v1=True)
+    CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -45,8 +65,12 @@ class ProfileDisplaynameRestServlet(RestServlet):
             requester = await self.auth.get_user_by_req(request)
             requester_user = requester.user
 
-        user = UserID.from_string(user_id)
+        if not UserID.is_valid(user_id):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
+            )
 
+        user = UserID.from_string(user_id)
         await self.profile_handler.check_profile_query_allowed(user, requester_user)
 
         displayname = await self.profile_handler.get_displayname(user)
@@ -62,7 +86,7 @@ class ProfileDisplaynameRestServlet(RestServlet):
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         user = UserID.from_string(user_id)
-        is_admin = await self.auth.is_server_admin(requester.user)
+        is_admin = await self.auth.is_server_admin(requester)
 
         content = parse_json_object_from_request(request)
 
@@ -75,13 +99,18 @@ class ProfileDisplaynameRestServlet(RestServlet):
                 errcode=Codes.BAD_JSON,
             )
 
-        await self.profile_handler.set_displayname(user, requester, new_name, is_admin)
+        propagate = _read_propagate(self.hs, request)
+
+        await self.profile_handler.set_displayname(
+            user, requester, new_name, is_admin, propagate=propagate
+        )
 
         return 200, {}
 
 
 class ProfileAvatarURLRestServlet(RestServlet):
     PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)/avatar_url", v1=True)
+    CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -98,8 +127,12 @@ class ProfileAvatarURLRestServlet(RestServlet):
             requester = await self.auth.get_user_by_req(request)
             requester_user = requester.user
 
-        user = UserID.from_string(user_id)
+        if not UserID.is_valid(user_id):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
+            )
 
+        user = UserID.from_string(user_id)
         await self.profile_handler.check_profile_query_allowed(user, requester_user)
 
         avatar_url = await self.profile_handler.get_avatar_url(user)
@@ -115,7 +148,7 @@ class ProfileAvatarURLRestServlet(RestServlet):
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request)
         user = UserID.from_string(user_id)
-        is_admin = await self.auth.is_server_admin(requester.user)
+        is_admin = await self.auth.is_server_admin(requester)
 
         content = parse_json_object_from_request(request)
         try:
@@ -125,8 +158,10 @@ class ProfileAvatarURLRestServlet(RestServlet):
                 400, "Missing key 'avatar_url'", errcode=Codes.MISSING_PARAM
             )
 
+        propagate = _read_propagate(self.hs, request)
+
         await self.profile_handler.set_avatar_url(
-            user, requester, new_avatar_url, is_admin
+            user, requester, new_avatar_url, is_admin, propagate=propagate
         )
 
         return 200, {}
@@ -134,6 +169,7 @@ class ProfileAvatarURLRestServlet(RestServlet):
 
 class ProfileRestServlet(RestServlet):
     PATTERNS = client_patterns("/profile/(?P<user_id>[^/]*)", v1=True)
+    CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -150,8 +186,12 @@ class ProfileRestServlet(RestServlet):
             requester = await self.auth.get_user_by_req(request)
             requester_user = requester.user
 
-        user = UserID.from_string(user_id)
+        if not UserID.is_valid(user_id):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "Invalid user id", Codes.INVALID_PARAM
+            )
 
+        user = UserID.from_string(user_id)
         await self.profile_handler.check_profile_query_allowed(user, requester_user)
 
         displayname = await self.profile_handler.get_displayname(user)

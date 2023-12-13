@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Dict, List
+from typing import List, Optional, Tuple, cast
 
 from synapse.api.errors import SynapseError
 from synapse.storage.database import LoggingTransaction
@@ -66,13 +66,15 @@ class EventForwardExtremitiesStore(
             """
 
             txn.execute(sql, (event_id, room_id))
+
+            deleted_count = txn.rowcount
             logger.info(
                 "Deleted %s extra forward extremities for room %s",
-                txn.rowcount,
+                deleted_count,
                 room_id,
             )
 
-            if txn.rowcount > 0:
+            if deleted_count > 0:
                 # Invalidate the cache
                 self._invalidate_cache_and_stream(
                     txn,
@@ -80,7 +82,7 @@ class EventForwardExtremitiesStore(
                     (room_id,),
                 )
 
-            return txn.rowcount
+            return deleted_count
 
         return await self.db_pool.runInteraction(
             "delete_forward_extremities_for_room",
@@ -89,12 +91,17 @@ class EventForwardExtremitiesStore(
 
     async def get_forward_extremities_for_room(
         self, room_id: str
-    ) -> List[Dict[str, Any]]:
-        """Get list of forward extremities for a room."""
+    ) -> List[Tuple[str, int, int, Optional[int]]]:
+        """
+        Get list of forward extremities for a room.
+
+        Returns:
+            A list of tuples of event_id, state_group, depth, and received_ts.
+        """
 
         def get_forward_extremities_for_room_txn(
             txn: LoggingTransaction,
-        ) -> List[Dict[str, Any]]:
+        ) -> List[Tuple[str, int, int, Optional[int]]]:
             sql = """
                 SELECT event_id, state_group, depth, received_ts
                 FROM event_forward_extremities
@@ -104,7 +111,7 @@ class EventForwardExtremitiesStore(
             """
 
             txn.execute(sql, (room_id,))
-            return self.db_pool.cursor_to_dict(txn)
+            return cast(List[Tuple[str, int, int, Optional[int]]], txn.fetchall())
 
         return await self.db_pool.runInteraction(
             "get_forward_extremities_for_room",

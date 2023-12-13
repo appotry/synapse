@@ -17,13 +17,14 @@
 
 """Contains constants from the specification."""
 
-from typing_extensions import Final
+import enum
+from typing import Final
 
 # the max size of a (canonical-json-encoded) event
 MAX_PDU_SIZE = 65536
 
 # the "depth" field on events is limited to 2**63 - 1
-MAX_DEPTH = 2 ** 63 - 1
+MAX_DEPTH = 2**63 - 1
 
 # the maximum length for a room alias is 255 characters
 MAX_ALIAS_LENGTH = 255
@@ -31,10 +32,8 @@ MAX_ALIAS_LENGTH = 255
 # the maximum length for a user id is 255 characters
 MAX_USERID_LENGTH = 255
 
-# The maximum length for a group id is 255 characters
-MAX_GROUPID_LENGTH = 255
-MAX_GROUP_CATEGORYID_LENGTH = 255
-MAX_GROUP_ROLEID_LENGTH = 255
+# Constant value used for the pseudo-thread which is the main timeline.
+MAIN_TIMELINE: Final = "main"
 
 
 class Membership:
@@ -65,6 +64,8 @@ class JoinRules:
     PRIVATE: Final = "private"
     # As defined for MSC3083.
     RESTRICTED: Final = "restricted"
+    # As defined for MSC3787.
+    KNOCK_RESTRICTED: Final = "knock_restricted"
 
 
 class RestrictedJoinRuleTypes:
@@ -81,7 +82,7 @@ class LoginType:
     TERMS: Final = "m.login.terms"
     SSO: Final = "m.login.sso"
     DUMMY: Final = "m.login.dummy"
-    REGISTRATION_TOKEN: Final = "org.matrix.msc3231.login.registration_token"
+    REGISTRATION_TOKEN: Final = "m.login.registration_token"
 
 
 # This is used in the `type` parameter for /register when called by
@@ -98,7 +99,6 @@ class EventTypes:
     Aliases: Final = "m.room.aliases"
     Redaction: Final = "m.room.redaction"
     ThirdPartyInvite: Final = "m.room.third_party_invite"
-    RelatedGroups: Final = "m.room.related_groups"
 
     RoomHistoryVisibility: Final = "m.room.history_visibility"
     CanonicalAlias: Final = "m.room.canonical_alias"
@@ -122,9 +122,7 @@ class EventTypes:
     SpaceChild: Final = "m.space.child"
     SpaceParent: Final = "m.space.parent"
 
-    MSC2716_INSERTION: Final = "org.matrix.msc2716.insertion"
-    MSC2716_BATCH: Final = "org.matrix.msc2716.batch"
-    MSC2716_MARKER: Final = "org.matrix.msc2716.marker"
+    Reaction: Final = "m.reaction"
 
 
 class ToDeviceEventTypes:
@@ -140,11 +138,18 @@ class DeviceKeyAlgorithms:
 
 
 class EduTypes:
-    Presence: Final = "m.presence"
+    PRESENCE: Final = "m.presence"
+    TYPING: Final = "m.typing"
+    RECEIPT: Final = "m.receipt"
+    DEVICE_LIST_UPDATE: Final = "m.device_list_update"
+    SIGNING_KEY_UPDATE: Final = "m.signing_key_update"
+    UNSTABLE_SIGNING_KEY_UPDATE: Final = "org.matrix.signing_key_update"
+    DIRECT_TO_DEVICE: Final = "m.direct_to_device"
 
 
 class RejectedReason:
     AUTH_ERROR: Final = "auth_error"
+    OVERSIZED_EVENT: Final = "oversized_event"
 
 
 class RoomCreationPreset:
@@ -178,7 +183,7 @@ class RelationTypes:
     ANNOTATION: Final = "m.annotation"
     REPLACE: Final = "m.replace"
     REFERENCE: Final = "m.reference"
-    THREAD: Final = "io.element.thread"
+    THREAD: Final = "m.thread"
 
 
 class LimitBlockingTypes:
@@ -205,23 +210,21 @@ class EventContentFields:
     FEDERATE: Final = "m.federate"
 
     # The creator of the room, as used in `m.room.create` events.
+    #
+    # This is deprecated in MSC2175.
     ROOM_CREATOR: Final = "creator"
 
     # Used in m.room.guest_access events.
     GUEST_ACCESS: Final = "guest_access"
 
-    # Used on normal messages to indicate they were historically imported after the fact
-    MSC2716_HISTORICAL: Final = "org.matrix.msc2716.historical"
-    # For "insertion" events to indicate what the next batch ID should be in
-    # order to connect to it
-    MSC2716_NEXT_BATCH_ID: Final = "org.matrix.msc2716.next_batch_id"
-    # Used on "batch" events to indicate which insertion event it connects to
-    MSC2716_BATCH_ID: Final = "org.matrix.msc2716.batch_id"
-    # For "marker" events
-    MSC2716_MARKER_INSERTION: Final = "org.matrix.msc2716.marker.insertion"
-
     # The authorising user for joining a restricted room.
     AUTHORISING_USER: Final = "join_authorised_via_users_server"
+
+    # Use for mentioning users.
+    MENTIONS: Final = "m.mentions"
+
+    # an unspecced field added to to-device messages to identify them uniquely-ish
+    TO_DEVICE_MSGID: Final = "org.matrix.msgid"
 
 
 class RoomTypes:
@@ -238,6 +241,8 @@ class RoomEncryptionAlgorithms:
 class AccountDataTypes:
     DIRECT: Final = "m.direct"
     IGNORED_USER_LIST: Final = "m.ignored_user_list"
+    TAG: Final = "m.tag"
+    PUSH_RULES: Final = "m.push_rules"
 
 
 class HistoryVisibility:
@@ -253,5 +258,33 @@ class GuestAccess:
     FORBIDDEN: Final = "forbidden"
 
 
-class ReadReceiptEventFields:
-    MSC2285_HIDDEN: Final = "org.matrix.msc2285.hidden"
+class ReceiptTypes:
+    READ: Final = "m.read"
+    READ_PRIVATE: Final = "m.read.private"
+    FULLY_READ: Final = "m.fully_read"
+
+
+class PublicRoomsFilterFields:
+    """Fields in the search filter for `/publicRooms` that we understand.
+
+    As defined in https://spec.matrix.org/v1.3/client-server-api/#post_matrixclientv3publicrooms
+    """
+
+    GENERIC_SEARCH_TERM: Final = "generic_search_term"
+    ROOM_TYPES: Final = "room_types"
+
+
+class ApprovalNoticeMedium:
+    """Identifier for the medium this server will use to serve notice of approval for a
+    specific user's registration.
+
+    As defined in https://github.com/matrix-org/matrix-spec-proposals/blob/babolivier/m_not_approved/proposals/3866-user-not-approved-error.md
+    """
+
+    NONE = "org.matrix.msc3866.none"
+    EMAIL = "org.matrix.msc3866.email"
+
+
+class Direction(enum.Enum):
+    BACKWARDS = "b"
+    FORWARDS = "f"

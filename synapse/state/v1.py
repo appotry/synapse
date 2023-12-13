@@ -17,7 +17,6 @@ import logging
 from typing import (
     Awaitable,
     Callable,
-    Collection,
     Dict,
     Iterable,
     List,
@@ -30,9 +29,9 @@ from typing import (
 from synapse import event_auth
 from synapse.api.constants import EventTypes
 from synapse.api.errors import AuthError
-from synapse.api.room_versions import RoomVersion, RoomVersions
+from synapse.api.room_versions import RoomVersion
 from synapse.events import EventBase
-from synapse.types import MutableStateMap, StateMap
+from synapse.types import MutableStateMap, StateMap, StrCollection
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ async def resolve_events_with_store(
     room_version: RoomVersion,
     state_sets: Sequence[StateMap[str]],
     event_map: Optional[Dict[str, EventBase]],
-    state_map_factory: Callable[[Collection[str]], Awaitable[Dict[str, EventBase]]],
+    state_map_factory: Callable[[StrCollection], Awaitable[Dict[str, EventBase]]],
 ) -> StateMap[str]:
     """
     Args:
@@ -330,8 +329,7 @@ def _resolve_auth_events(
         auth_events[(prev_event.type, prev_event.state_key)] = prev_event
         try:
             # The signatures have already been checked at this point
-            event_auth.check_auth_rules_for_event(
-                RoomVersions.V1,
+            event_auth.check_state_dependent_auth_rules(
                 event,
                 auth_events.values(),
             )
@@ -348,8 +346,7 @@ def _resolve_normal_events(
     for event in _ordered_events(events):
         try:
             # The signatures have already been checked at this point
-            event_auth.check_auth_rules_for_event(
-                RoomVersions.V1,
+            event_auth.check_state_dependent_auth_rules(
                 event,
                 auth_events.values(),
             )

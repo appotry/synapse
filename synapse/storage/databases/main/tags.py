@@ -15,12 +15,15 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, List, Tuple, cast
+from typing import Any, Dict, Iterable, List, Mapping, Tuple, cast
 
+from synapse.api.constants import AccountDataTypes
+from synapse.replication.tcp.streams import AccountDataStream
 from synapse.storage._base import db_to_json
 from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases.main.account_data import AccountDataWorkerStore
-from synapse.types import JsonDict
+from synapse.storage.util.id_generators import AbstractStreamIdGenerator
+from synapse.types import JsonDict, JsonMapping
 from synapse.util import json_encoder
 from synapse.util.caches.descriptors import cached
 
@@ -29,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 class TagsWorkerStore(AccountDataWorkerStore):
     @cached()
-    async def get_tags_for_user(self, user_id: str) -> Dict[str, Dict[str, JsonDict]]:
+    async def get_tags_for_user(
+        self, user_id: str
+    ) -> Mapping[str, Mapping[str, JsonMapping]]:
         """Get all the tags for a user.
 
 
@@ -40,19 +45,22 @@ class TagsWorkerStore(AccountDataWorkerStore):
             tag content.
         """
 
-        rows = await self.db_pool.simple_select_list(
-            "room_tags", {"user_id": user_id}, ["room_id", "tag", "content"]
+        rows = cast(
+            List[Tuple[str, str, str]],
+            await self.db_pool.simple_select_list(
+                "room_tags", {"user_id": user_id}, ["room_id", "tag", "content"]
+            ),
         )
 
         tags_by_room: Dict[str, Dict[str, JsonDict]] = {}
-        for row in rows:
-            room_tags = tags_by_room.setdefault(row["room_id"], {})
-            room_tags[row["tag"]] = db_to_json(row["content"])
+        for room_id, tag, content in rows:
+            room_tags = tags_by_room.setdefault(room_id, {})
+            room_tags[tag] = db_to_json(content)
         return tags_by_room
 
     async def get_all_updated_tags(
         self, instance_name: str, last_id: int, current_id: int, limit: int
-    ) -> Tuple[List[Tuple[int, Tuple[str, str, str]]], int, bool]:
+    ) -> Tuple[List[Tuple[int, str, str]], int, bool]:
         """Get updates for tags replication stream.
 
         Args:
@@ -71,7 +79,7 @@ class TagsWorkerStore(AccountDataWorkerStore):
             The token returned can be used in a subsequent call to this
             function to get further updatees.
 
-            The updates are a list of 2-tuples of stream ID and the row data
+            The updates are a list of tuples of stream ID, user ID and room ID
         """
 
         if last_id == current_id:
@@ -94,42 +102,17 @@ class TagsWorkerStore(AccountDataWorkerStore):
             "get_all_updated_tags", get_all_updated_tags_txn
         )
 
-        def get_tag_content(
-            txn: LoggingTransaction, tag_ids
-        ) -> List[Tuple[int, Tuple[str, str, str]]]:
-            sql = "SELECT tag, content FROM room_tags WHERE user_id=? AND room_id=?"
-            results = []
-            for stream_id, user_id, room_id in tag_ids:
-                txn.execute(sql, (user_id, room_id))
-                tags = []
-                for tag, content in txn:
-                    tags.append(json_encoder.encode(tag) + ":" + content)
-                tag_json = "{" + ",".join(tags) + "}"
-                results.append((stream_id, (user_id, room_id, tag_json)))
-
-            return results
-
-        batch_size = 50
-        results = []
-        for i in range(0, len(tag_ids), batch_size):
-            tags = await self.db_pool.runInteraction(
-                "get_all_updated_tag_content",
-                get_tag_content,
-                tag_ids[i : i + batch_size],
-            )
-            results.extend(tags)
-
         limited = False
         upto_token = current_id
-        if len(results) >= limit:
-            upto_token = results[-1][0]
+        if len(tag_ids) >= limit:
+            upto_token = tag_ids[-1][0]
             limited = True
 
-        return results, upto_token, limited
+        return tag_ids, upto_token, limited
 
     async def get_updated_tags(
         self, user_id: str, stream_id: int
-    ) -> Dict[str, Dict[str, JsonDict]]:
+    ) -> Mapping[str, Mapping[str, JsonMapping]]:
         """Get all the tags for the rooms where the tags have changed since the
         given version
 
@@ -181,13 +164,16 @@ class TagsWorkerStore(AccountDataWorkerStore):
         Returns:
             A mapping of tags to tag content.
         """
-        rows = await self.db_pool.simple_select_list(
-            table="room_tags",
-            keyvalues={"user_id": user_id, "room_id": room_id},
-            retcols=("tag", "content"),
-            desc="get_tags_for_room",
+        rows = cast(
+            List[Tuple[str, str]],
+            await self.db_pool.simple_select_list(
+                table="room_tags",
+                keyvalues={"user_id": user_id, "room_id": room_id},
+                retcols=("tag", "content"),
+                desc="get_tags_for_room",
+            ),
         )
-        return {row["tag"]: db_to_json(row["content"]) for row in rows}
+        return {tag: db_to_json(content) for tag, content in rows}
 
     async def add_tag_to_room(
         self, user_id: str, room_id: str, tag: str, content: JsonDict
@@ -204,6 +190,7 @@ class TagsWorkerStore(AccountDataWorkerStore):
             The next account data ID.
         """
         assert self._can_write_to_account_data
+        assert isinstance(self._account_data_id_gen, AbstractStreamIdGenerator)
 
         content_json = json_encoder.encode(content)
 
@@ -230,6 +217,7 @@ class TagsWorkerStore(AccountDataWorkerStore):
             The next account data ID.
         """
         assert self._can_write_to_account_data
+        assert isinstance(self._account_data_id_gen, AbstractStreamIdGenerator)
 
         def remove_tag_txn(txn: LoggingTransaction, next_id: int) -> None:
             sql = (
@@ -247,7 +235,7 @@ class TagsWorkerStore(AccountDataWorkerStore):
         return self._account_data_id_gen.get_current_token()
 
     def _update_revision_txn(
-        self, txn, user_id: str, room_id: str, next_id: int
+        self, txn: LoggingTransaction, user_id: str, room_id: str, next_id: int
     ) -> None:
         """Update the latest revision of the tags for the given user and room.
 
@@ -258,6 +246,7 @@ class TagsWorkerStore(AccountDataWorkerStore):
             next_id: The the revision to advance to.
         """
         assert self._can_write_to_account_data
+        assert isinstance(self._account_data_id_gen, AbstractStreamIdGenerator)
 
         txn.call_after(
             self._account_data_stream_cache.entity_has_changed, user_id, next_id
@@ -286,6 +275,23 @@ class TagsWorkerStore(AccountDataWorkerStore):
                 # which stream_id ends up in the table, as long as it is higher
                 # than the id that the client has.
                 pass
+
+    def process_replication_rows(
+        self,
+        stream_name: str,
+        instance_name: str,
+        token: int,
+        rows: Iterable[Any],
+    ) -> None:
+        if stream_name == AccountDataStream.NAME:
+            for row in rows:
+                if row.data_type == AccountDataTypes.TAG:
+                    self.get_tags_for_user.invalidate((row.user_id,))
+                    self._account_data_stream_cache.entity_has_changed(
+                        row.user_id, token
+                    )
+
+        super().process_replication_rows(stream_name, instance_name, token, rows)
 
 
 class TagsStore(TagsWorkerStore):
